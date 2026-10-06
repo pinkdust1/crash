@@ -1,23 +1,16 @@
 services:
   - type: web
-    name: zero7-crash
+    name: crash
     runtime: python
     buildCommand: pip install -r requirements.txt
-    # ONE worker only: the engine lives in-process
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1   # ONE worker: engine lives in-process
     healthCheckPath: /health
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
       - key: GAME_UNDERBOARD_TOKEN
         sync: false
-      - key: DB_HOST
+      - key: PHP_API_URL            # https://admin.zero7.casino/core.php
         sync: false
-      - key: DB_PORT
-        value: "3306"
-      - key: DB_USER
+      - key: PUBLIC_WS_URL          # wss://<service>.onrender.com/ws/crash
         sync: false
-      - key: DB_PASSWORD
-        sync: false
-      - key: DB_NAME
-        sync: false
-      - key: PUBLIC_WS_URL
-        sync: false   # e.g. wss://zero7-crash.onrender.com/ws/crash
