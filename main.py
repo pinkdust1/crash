@@ -156,7 +156,9 @@ def cashout_event(b):
 
 def snapshot_for(uid):
     r = st.round
-    return {"type": "snapshot", "server_time": now_ms(), "round": round_view(r, False),
+    rv = round_view(r, False)
+    rv["betting_ends_at"] = r["betting_ends_at"]    # needed to resume the countdown after reconnect
+    return {"type": "snapshot", "server_time": now_ms(), "round": rv,
             "my_bet": my_bet_view(st.by_user[uid]) if uid in st.by_user else None,
             "history": list(st.history), "players": [player_view(b) for b in st.bets.values()]}
 
@@ -396,7 +398,7 @@ def need_ready():
 @app.post("/crash/config")
 async def r_config(request: Request):
     return {"success": True, "min_bet": int(MIN_BET), "max_bet": int(MAX_BET), "currencies": list(CURRENCIES),
-            "betting_duration_ms": BETTING_MS, "crash_duration_ms": CRASH_MS}
+            "betting_duration_ms": BETTING_MS, "crash_duration_ms": CRASH_MS, "growth_k": GROWTH_K}
 
 @app.post("/crash/ws-ticket")
 async def r_ticket(request: Request):
