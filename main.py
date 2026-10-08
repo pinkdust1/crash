@@ -17,6 +17,8 @@ PHP_API_URL = os.getenv("PHP_API_URL", "")
 PUBLIC_WS_URL = os.getenv("PUBLIC_WS_URL", "")
 BETTING_MS = int(os.getenv("CRASH_BETTING_MS", "5000"))
 CRASH_MS = int(os.getenv("CRASH_CRASH_MS", "2500"))
+SYNC_MS = int(os.getenv("CRASH_SYNC_MS", "250"))      # multiplier_update period (client interpolates)
+DIAG = os.getenv("CRASH_DIAG", "1") == "1"            # log network diagnostics at startup
 D = Decimal
 MIN_BET, MAX_BET = D(os.getenv("CRASH_MIN_BET", "1")), D(os.getenv("CRASH_MAX_BET", "100000"))
 GROWTH_K = float(os.getenv("CRASH_GROWTH_K", "0.00006"))   # m(t)=exp(K*t_ms)
@@ -39,9 +41,10 @@ http: httpx.AsyncClient = None
 async def php(action, payload, timeout=6.0):
     try:
         r = await http.post(PHP_API_URL, params={"action": action}, json=payload,
-                            headers={"X-Game-Token": GAME_TOKEN}, timeout=timeout)
+                            headers={"X-Game-Token": GAME_TOKEN},
+                            timeout=httpx.Timeout(timeout, connect=min(4.0, timeout)))
     except httpx.HTTPError as e:
-        log.warning("[CRASH] php transport error: %s", type(e).__name__)
+        log.warning("[CRASH] php transport error: %s %r", type(e).__name__, e)
         raise Unavailable()
     try:
         j = r.json()
@@ -163,16 +166,20 @@ def snapshot_for(uid):
             "history": list(st.history), "players": [player_view(b) for b in st.bets.values()]}
 
 # ---------------- ws ----------------
+async def _send(ws, data):
+    try:
+        await asyncio.wait_for(ws.send_text(data), 2)
+    except Exception:
+        return ws
+    return None
+
 async def broadcast(msg):
+    if not clients:
+        return
     data = json.dumps(msg)
-    dead = []
-    for ws in list(clients):
-        try:
-            await asyncio.wait_for(ws.send_text(data), 2)
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        clients.pop(ws, None)
+    for ws in await asyncio.gather(*(_send(w, data) for w in list(clients))):
+        if ws is not None:
+            clients.pop(ws, None)
 
 _tk_key = lambda: hmac.new(GAME_TOKEN.encode(), b"crash-ws-ticket-v1", hashlib.sha256).digest()
 
@@ -271,19 +278,20 @@ async def start_round(r):
 async def run_running(r):
     cp = r["cp"]
     t_crash = math.log(float(cp)) / GROWTH_K if cp > 1 else 0
-    tick = 0
+    last_bc = -1000
     while True:
         t = now_ms() - r["started_at"]
         if t >= t_crash:
             break
         m = mult_at(t)
-        if tick % 2 == 0:
-            await broadcast({"type": "multiplier_update", "round_id": r["round_id"], "multiplier": float(floor2(m)), "server_time": now_ms()})
+        if t - last_bc >= SYNC_MS:      # sync point only: the client animates the curve itself
+            last_bc = t
+            await broadcast({"type": "multiplier_update", "round_id": r["round_id"], "multiplier": float(m),
+                             "started_at": r["started_at"], "server_time": now_ms()})
         async with lock:
             items = decide_auto(r, m, strict=False)
         await flush_auto(items)
-        tick += 1
-        await asyncio.sleep(max(0.005, min(0.1, (t_crash - t) / 1000)))
+        await asyncio.sleep(max(0.005, min(0.05, (t_crash - t) / 1000)))
     async with lock:   # atomic wrt manual cashout decisions
         items = decide_auto(r, cp, strict=True)
         for b in st.bets.values():
@@ -337,13 +345,37 @@ async def engine():
             log.exception("[CRASH] engine error")
             await asyncio.sleep(2)
 
+# ---------------- startup network diagnostics ----------------
+async def net_diag():
+    import socket
+    host = httpx.URL(PHP_API_URL).host
+    try:
+        async with httpx.AsyncClient(timeout=8) as c:
+            log.warning("[DIAG] render outbound ip = %s", (await c.get("https://api.ipify.org")).text)
+    except Exception as e:
+        log.warning("[DIAG] ipify failed: %r", e)
+    try:
+        log.warning("[DIAG] dns %s -> %s", host, socket.gethostbyname_ex(host)[2])
+    except Exception as e:
+        log.warning("[DIAG] dns failed: %r", e)
+    for port in (443, 80):
+        t0 = time.monotonic()
+        try:
+            _, w = await asyncio.wait_for(asyncio.open_connection(host, port), 6)
+            w.close()
+            log.warning("[DIAG] tcp %s:%s OK %.0fms", host, port, (time.monotonic() - t0) * 1000)
+        except Exception as e:
+            log.warning("[DIAG] tcp %s:%s FAIL %r", host, port, e)
+
 # ---------------- app ----------------
 @asynccontextmanager
 async def lifespan(app):
     global http
     if not GAME_TOKEN or not PHP_API_URL:
         raise RuntimeError("GAME_UNDERBOARD_TOKEN and PHP_API_URL must be set")
-    http = httpx.AsyncClient()
+    http = httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0))
+    if DIAG:
+        asyncio.create_task(net_diag())
     task = asyncio.create_task(engine())
     yield
     task.cancel()
