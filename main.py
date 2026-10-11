@@ -18,6 +18,7 @@ PUBLIC_WS_URL = os.getenv("PUBLIC_WS_URL", "")
 BETTING_MS = int(os.getenv("CRASH_BETTING_MS", "5000"))
 CRASH_MS = int(os.getenv("CRASH_CRASH_MS", "2500"))
 SYNC_MS = int(os.getenv("CRASH_SYNC_MS", "250"))      # multiplier_update period (client interpolates)
+MIN_INSTANT_MS = int(os.getenv("CRASH_MIN_INSTANT_MS", "400"))  # cp == 1.00: keep 'running' this long so clients actually see the start
 DIAG = os.getenv("CRASH_DIAG", "1") == "1"            # log network diagnostics at startup
 D = Decimal
 MIN_BET, MAX_BET = D(os.getenv("CRASH_MIN_BET", "1")), D(os.getenv("CRASH_MAX_BET", "100000"))
@@ -135,7 +136,7 @@ def round_view(r, with_time=True):
     done = r["state"] in ("crashed", "finished")
     cur = 1.0
     if r["state"] == "running":
-        cur = float(floor2(mult_at(now_ms() - r["started_at"])))
+        cur = float(min(floor2(mult_at(now_ms() - r["started_at"])), r["cp"]))   # never above the crash point
     elif done:
         cur = float(r["crash_point"])
     v = {"round_id": r["round_id"], "state": "waiting" if r["state"] == "closing" else r["state"], "created_at": r["created_at"],
@@ -169,10 +170,21 @@ def snapshot_for(uid):
 # ---------------- ws ----------------
 async def _send(ws, data):
     try:
-        await asyncio.wait_for(ws.send_text(data), 2)
+        await asyncio.wait_for(ws.send_text(data), 1.0)   # a slow client must not stall the engine for long
     except Exception:
         return ws
     return None
+
+_bg = set()
+
+async def _drop_ws(ws, uid):
+    """Close a socket whose send failed. Without this the client keeps a 'zombie' connection that stays open
+    but never receives round_crashed/multiplier_update -> its local curve runs away."""
+    log.info("[CRASH] websocket dropped (send failed) uid=%s", uid)
+    try:
+        await asyncio.wait_for(ws.close(code=1011), 2)
+    except Exception:
+        pass
 
 async def broadcast(msg):
     if not clients:
@@ -180,7 +192,9 @@ async def broadcast(msg):
     data = json.dumps(msg)
     for ws in await asyncio.gather(*(_send(w, data) for w in list(clients))):
         if ws is not None:
-            clients.pop(ws, None)
+            t = asyncio.create_task(_drop_ws(ws, clients.pop(ws, None)))
+            _bg.add(t)
+            t.add_done_callback(_bg.discard)
 
 _tk_key = lambda: hmac.new(GAME_TOKEN.encode(), b"crash-ws-ticket-v1", hashlib.sha256).digest()
 
@@ -280,6 +294,8 @@ async def run_running(r):
     cp = r["cp"]
     t_crash = math.log(float(cp)) / GROWTH_K if cp > 1 else 0
     last_bc = -1000
+    if t_crash <= 0:                 # cp == 1.00: don't crash in the same millisecond as round_started
+        await asyncio.sleep(MIN_INSTANT_MS / 1000)
     while True:
         t = now_ms() - r["started_at"]
         if t >= t_crash:
@@ -301,7 +317,7 @@ async def run_running(r):
         t = now_ms()
         r.update(state="crashed", crashed_at=t, crash_point=cp)
     await flush_auto(items)
-    log.info("[CRASH] round crashed")
+    log.info("[CRASH] round crashed cp=%s", cp)
     await broadcast({"type": "round_crashed", "round_id": r["round_id"], "crash_point": float(cp), "crashed_at": t,
                      "server_time": t, "server_seed": r["server_seed"]})
     st.history.appendleft({"round_id": r["round_id"], "crash_point": float(cp), "created_at": r["created_at"]})
@@ -574,6 +590,7 @@ async def r_details(request: Request):
 @app.websocket("/ws/crash")
 async def ws_crash(ws: WebSocket):
     await ws.accept()
+    uid = None
     try:
         msg = json.loads(await asyncio.wait_for(ws.receive_text(), 10))
         t = check_ticket(msg.get("ticket", "")) if msg.get("type") == "auth" else None
@@ -584,15 +601,17 @@ async def ws_crash(ws: WebSocket):
         if not st.ready or st.round is None:
             await ws.close(code=1013)
             return
-        clients[ws] = int(t["uid"])
-        log.info("[CRASH] websocket connected")
-        await ws.send_text(json.dumps(snapshot_for(int(t["uid"]))))
+        uid = int(t["uid"])
+        clients[ws] = uid
+        log.info("[CRASH] websocket connected uid=%s clients=%d", uid, len(clients))
+        await ws.send_text(json.dumps(snapshot_for(uid)))
         while True:
-            await ws.receive_text()
+            if await ws.receive_text() == "ping":       # client heartbeat
+                await ws.send_text('{"type":"pong","server_time":%d}' % now_ms())
     except (WebSocketDisconnect, asyncio.TimeoutError, json.JSONDecodeError):
         pass
     except Exception:
         log.exception("[CRASH] ws error")
     finally:
         if clients.pop(ws, None) is not None:
-            log.info("[CRASH] websocket disconnected")
+            log.info("[CRASH] websocket disconnected uid=%s state=%s", uid, st.round["state"] if st.round else None)
