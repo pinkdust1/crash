@@ -606,7 +606,8 @@ async def ws_crash(ws: WebSocket):
         log.info("[CRASH] websocket connected uid=%s clients=%d", uid, len(clients))
         await ws.send_text(json.dumps(snapshot_for(uid)))
         while True:
-            if await ws.receive_text() == "ping":       # client heartbeat
+            txt = await ws.receive_text()
+            if txt == "ping" or (len(txt) < 64 and '"ping"' in txt):   # client heartbeat: plain "ping" or {"type":"ping"}
                 await ws.send_text('{"type":"pong","server_time":%d}' % now_ms())
     except (WebSocketDisconnect, asyncio.TimeoutError, json.JSONDecodeError):
         pass
