@@ -23,7 +23,7 @@ DIAG = os.getenv("CRASH_DIAG", "1") == "1"            # log network diagnostics 
 D = Decimal
 MIN_BET, MAX_BET = D(os.getenv("CRASH_MIN_BET", "1")), D(os.getenv("CRASH_MAX_BET", "100000"))
 GROWTH_K = float(os.getenv("CRASH_GROWTH_K", "0.00006"))   # m(t)=exp(K*t_ms)
-RTP = 0.50            # Return To Player: 35%  ->  House Edge = 1 - RTP = 65%
+RTP = 0.60            # Return To Player: 35%  ->  House Edge = 1 - RTP = 65%
 assert 0 < RTP <= 1
 CURRENCIES = ("xbite", "gram", "stars")
 Q2 = D("0.01")
