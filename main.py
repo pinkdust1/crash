@@ -22,7 +22,8 @@ DIAG = os.getenv("CRASH_DIAG", "1") == "1"            # log network diagnostics 
 D = Decimal
 MIN_BET, MAX_BET = D(os.getenv("CRASH_MIN_BET", "1")), D(os.getenv("CRASH_MAX_BET", "100000"))
 GROWTH_K = float(os.getenv("CRASH_GROWTH_K", "0.00006"))   # m(t)=exp(K*t_ms)
-HOUSE_EDGE_MOD = 33   # measured RTP ~96.4%
+RTP = 0.35            # Return To Player: 35%  ->  House Edge = 1 - RTP = 65%
+assert 0 < RTP <= 1
 CURRENCIES = ("xbite", "gram", "stars")
 Q2 = D("0.01")
 now_ms = lambda: int(time.time() * 1000)
@@ -77,9 +78,9 @@ def crash_point_for(server_seed, client_seed, nonce) -> Decimal:
     """HMAC_SHA256(key=server_seed, msg=f"{client_seed}:{nonce}"); first 52 bits."""
     h = int(hmac.new(server_seed.encode(), f"{client_seed}:{nonce}".encode(), hashlib.sha256).hexdigest()[:13], 16)
     e = 2 ** 52
-    if h % HOUSE_EDGE_MOD == 0:
-        return D("1.00")
-    return D(math.floor((100 * e - h) / (e - h))) / 100
+    # P(crash >= x) = RTP / x  for x >= 1  ->  expected return for any cashout strategy = RTP
+    cp = math.floor(100 * RTP * e / (e - h))
+    return D(max(cp, 100)) / 100
 
 mult_at = lambda t_ms: D(math.exp(GROWTH_K * max(t_ms, 0)))
 floor2 = lambda x: x.quantize(Q2, rounding=ROUND_DOWN)
